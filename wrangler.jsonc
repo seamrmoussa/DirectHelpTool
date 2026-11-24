@@ -1,0 +1,8 @@
+{
+  "name": "directhelptool",
+  "compatibility_date": "2026-11-24",
+  "assets": {
+    "directory": "./dist/DirectHelpTool/browser",
+    "not_found_handling": "single-page-application",
+  },
+}
