@@ -621,8 +621,8 @@ export class RequestActions implements OnInit, OnDestroy {
             }
           )?.data?.data ?? [];
 
-        // 1. تجهيز الطلبات وترتيبها: أولاً حسب أولوية الدولة، وثانياً داخل كل دولة من الأكبر عدداً للأصغر
-        const normalizedOrders = rawItems
+        // 1. تجهيز الطلبات
+        const orders = rawItems
           .map((item, idx) => {
             const trackNumber = String(item.track_number ?? '').trim();
             const visaNameEn = String(item.visa?.name_en ?? item.country?.name_en ?? '').trim();
@@ -630,88 +630,111 @@ export class RequestActions implements OnInit, OnDestroy {
             return {
               trackNumber,
               visaNameEn,
+              countryKey: visaNameEn.toLowerCase(),
               applicantsCount,
               bgColor: this.getOrderBgColor(visaNameEn, applicantsCount),
               priority: this.getCountryPriority(visaNameEn),
               originalIndex: idx,
             };
           })
-          .filter((x) => Boolean(x.trackNumber))
-          .sort((a, b) => {
-            if (a.priority !== b.priority) return a.priority - b.priority;
-            if (b.applicantsCount !== a.applicantsCount) {
-              return b.applicantsCount - a.applicantsCount;
-            }
-            return a.originalIndex - b.originalIndex;
-          });
+          .filter((x) => Boolean(x.trackNumber));
 
-        const totalApplicants = normalizedOrders.reduce(
-          (sum, item) => sum + item.applicantsCount,
-          0,
+        const totalOrders = orders.length;
+        const totalApplicants = orders.reduce((sum, item) => sum + item.applicantsCount, 0);
+
+        // حساب عدد الطلبات المستهدف لكل موظف (الفائض يُطرح من آخر شخص ثم الذي قبله)
+        // مثال: 10 طلبات على 4 => [3, 3, 2, 2] | 4 طلبات على 4 => [1, 1, 1, 1]
+        const baseOrdersPerEmp = Math.floor(totalOrders / empCount);
+        const ordersRemainder = totalOrders % empCount;
+        const targetOrdersPerEmp = Array.from(
+          { length: empCount },
+          (_, i) => baseOrdersPerEmp + (i < ordersRemainder ? 1 : 0),
         );
-        const baseApplicantShare = Math.floor(totalApplicants / empCount);
-        const applicantRemainder = totalApplicants % empCount;
+
+        // حساب الحد الأقصى العادل لكل دولة لكل موظف حتى لا تتكدس دولة واحدة عند شخص واحد
+        const countryTotals = new Map<string, number>();
+        for (const o of orders) {
+          countryTotals.set(o.countryKey, (countryTotals.get(o.countryKey) ?? 0) + 1);
+        }
+        const maxPerCountryForEmp = new Map<string, number>();
+        for (const [cKey, count] of countryTotals.entries()) {
+          maxPerCountryForEmp.set(cKey, Math.ceil(count / empCount));
+        }
+
+        // 2. ترتيب الطلبات تنازلياً حسب عدد الأفراد (من 5+ إلى 1)، ثم حسب أولوية الدولة (من أمريكا لكندا)
+        // هذا يضمن أن Employee 1 يأخذ دائماً أكبر الطلبات في كل جولة، يليه Employee 2، ثم 3، ثم 4
+        const sortedOrders = [...orders].sort((a, b) => {
+          if (b.applicantsCount !== a.applicantsCount) {
+            return b.applicantsCount - a.applicantsCount;
+          }
+          if (a.priority !== b.priority) {
+            return a.priority - b.priority;
+          }
+          return a.originalIndex - b.originalIndex;
+        });
 
         const columns: EmployeeColumn[] = Array.from({ length: empCount }, (_, i) => ({
           index: i,
           name: `Employee ${i + 1}`,
           items: [],
           totalApplicants: 0,
-          targetApplicants: baseApplicantShare + (i < applicantRemainder ? 1 : 0),
+          targetApplicants: 0,
         }));
 
-        // تجميع الطلبات في مجموعات حسب الدولة بالترتيب المحدد
-        const countryGroups: Array<typeof normalizedOrders> = [];
-        for (const order of normalizedOrders) {
-          const lastGroup = countryGroups[countryGroups.length - 1];
-          if (!lastGroup || lastGroup[0].priority !== order.priority) {
-            countryGroups.push([order]);
-          } else {
-            lastGroup.push(order);
+        const empCountryCounts = Array.from({ length: empCount }, () => new Map<string, number>());
+
+        // 3. التوزيع الدوّار من الأول للأخير (0 -> 1 -> 2 -> ... -> empCount - 1)
+        let cursor = 0;
+
+        for (const order of sortedOrders) {
+          let chosenIdx = -1;
+          const countryCap = maxPerCountryForEmp.get(order.countryKey) ?? 1;
+
+          // المحاولة الأولى: شخص لم يكتمل نصيبه من الطلبات ولم يتجاوز حصته في هذه الدولة
+          for (let offset = 0; offset < empCount; offset++) {
+            const idx = (cursor + offset) % empCount;
+            const currentCountryCount = empCountryCounts[idx].get(order.countryKey) ?? 0;
+            if (
+              columns[idx].items.length < targetOrdersPerEmp[idx] &&
+              currentCountryCount < countryCap
+            ) {
+              chosenIdx = idx;
+              break;
+            }
           }
-        }
 
-        const maxSizeTakenByPerson = Array.from({ length: empCount }, () => 0);
-
-        for (const group of countryGroups) {
-          // عند بدء دولة جديدة، نبدأ من الشخص الأقل في عدد الطلبات، ثم الأقل في عدد الأفراد، ثم الأول في الترتيب
-          let startIdx = this.findLeastLoadedEmployeeIndex(columns);
-
-          for (const order of group) {
-            let chosenIdx = -1;
-
-            // فحص الأشخاص بالترتيب من نقطة البداية للبحث عن شخص لم يأخذ نفس الحجم أو أكبر
+          // المحاولة الثانية: شخص لم يكتمل نصيبه من الطلبات بغض النظر عن الدولة
+          if (chosenIdx === -1) {
             for (let offset = 0; offset < empCount; offset++) {
-              const candidateIdx = (startIdx + offset) % empCount;
-              if (maxSizeTakenByPerson[candidateIdx] < order.applicantsCount) {
-                chosenIdx = candidateIdx;
+              const idx = (cursor + offset) % empCount;
+              if (columns[idx].items.length < targetOrdersPerEmp[idx]) {
+                chosenIdx = idx;
                 break;
               }
             }
-
-            // إذا أخذ الجميع نفس الحجم أو أكبر، نرجع لأول شخص أقل في عدد الطلبات ثم الأفراد ثم الترتيب
-            if (chosenIdx === -1) {
-              chosenIdx = this.findLeastLoadedEmployeeIndex(columns);
-            }
-
-            const targetCol = columns[chosenIdx];
-            targetCol.items.push({
-              trackNumber: order.trackNumber,
-              visaNameEn: order.visaNameEn,
-              applicantsCount: order.applicantsCount,
-              bgColor: order.bgColor,
-            });
-            targetCol.totalApplicants += order.applicantsCount;
-
-            if (order.applicantsCount > maxSizeTakenByPerson[chosenIdx]) {
-              maxSizeTakenByPerson[chosenIdx] = order.applicantsCount;
-            }
-
-            startIdx = this.findLeastLoadedEmployeeIndex(columns);
           }
+
+          // Fallback أمان
+          if (chosenIdx === -1) {
+            chosenIdx = cursor % empCount;
+          }
+
+          columns[chosenIdx].items.push({
+            trackNumber: order.trackNumber,
+            visaNameEn: order.visaNameEn,
+            applicantsCount: order.applicantsCount,
+            bgColor: order.bgColor,
+          });
+          columns[chosenIdx].totalApplicants += order.applicantsCount;
+          empCountryCounts[chosenIdx].set(
+            order.countryKey,
+            (empCountryCounts[chosenIdx].get(order.countryKey) ?? 0) + 1,
+          );
+
+          cursor = (chosenIdx + 1) % empCount;
         }
 
-        // ترتيب عناصر كل عمود حسب أولوية الدولة ثم عدد الأفراد تنازلياً
+        // 4. ترتيب الطلبات داخل كل عمود حسب أولوية الدولة (من أمريكا لكندا) ثم عدد الأفراد
         for (const col of columns) {
           col.items.sort((a, b) => {
             const pDiff =
@@ -725,7 +748,7 @@ export class RequestActions implements OnInit, OnDestroy {
         this.isDistributionModalOpen.set(true);
         this.isError.set(false);
         this.statusMessage.set(
-          `Distributed ${normalizedOrders.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
+          `Distributed ${totalOrders} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
         );
       },
       error: (err) => {
@@ -734,21 +757,6 @@ export class RequestActions implements OnInit, OnDestroy {
         this.statusMessage.set(err?.message || 'Failed to fetch requests for distribution.');
       },
     });
-  }
-
-  private findLeastLoadedEmployeeIndex(columns: EmployeeColumn[]): number {
-    let bestIdx = 0;
-    for (let i = 1; i < columns.length; i++) {
-      if (columns[i].items.length < columns[bestIdx].items.length) {
-        bestIdx = i;
-      } else if (
-        columns[i].items.length === columns[bestIdx].items.length &&
-        columns[i].totalApplicants < columns[bestIdx].totalApplicants
-      ) {
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
   }
 
   private getCountryPriority(visaNameEn: string): number {
@@ -761,11 +769,11 @@ export class RequestActions implements OnInit, OnDestroy {
     const country = visaNameEn.trim().toLowerCase();
 
     if (country === 'united kingdom' || country === 'uk') {
-      return '#fca5a5';
+      return '#fca5a5'; // أحمر لطلبات بريطانيا دائماً
     }
 
     if (country === 'turkey' || country === 'türkiye') {
-      return '#d8b4fe';
+      return '#d8b4fe'; // بنفسجي لطلبات تركيا دائماً
     }
 
     if (applicantsCount <= 1) return '#ffffff';
@@ -782,7 +790,7 @@ export class RequestActions implements OnInit, OnDestroy {
     const htmlRows = col.items
       .map(
         (item) =>
-          `<tr><td style="background-color:${item.bgColor};mso-background-color:${item.bgColor};">${item.trackNumber}</td></tr>`,
+          `<tr><td style="background-color:${item.bgColor};mso-background-color:${item.bgColor};color:#000000;">${item.trackNumber}</td></tr>`,
       )
       .join('');
     const htmlFragment = `<table><tbody>${htmlRows}</tbody></table>`;
