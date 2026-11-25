@@ -95,6 +95,7 @@ export class RequestActions implements OnInit, OnDestroy {
     'germany',
     'czechia',
     'czech republic',
+    'czech',
     'sweden',
     'greece',
     'switzerland',
@@ -109,7 +110,6 @@ export class RequestActions implements OnInit, OnDestroy {
     'the netherlands',
     'netherlands',
     'turkey',
-    'türkiye',
     'united kingdom',
     'ireland',
     'canada',
@@ -621,7 +621,8 @@ export class RequestActions implements OnInit, OnDestroy {
             }
           )?.data?.data ?? [];
 
-        const normalized = rawItems
+        // ترتيب الطلبات حسب أولوية الدول ثم الحفاظ على الترتيب الأصلي
+        const orderedByCountry = rawItems
           .map((item, idx) => {
             const trackNumber = String(item.track_number ?? '').trim();
             const visaNameEn = String(item.visa?.name_en ?? item.country?.name_en ?? '').trim();
@@ -630,7 +631,7 @@ export class RequestActions implements OnInit, OnDestroy {
               trackNumber,
               visaNameEn,
               applicantsCount,
-              bgColor: this.getApplicantBgColor(applicantsCount),
+              bgColor: this.getOrderBgColor(visaNameEn, applicantsCount),
               priority: this.getCountryPriority(visaNameEn),
               originalIndex: idx,
             };
@@ -641,12 +642,25 @@ export class RequestActions implements OnInit, OnDestroy {
             return a.originalIndex - b.originalIndex;
           });
 
-        const totalApplicants = normalized.reduce((sum, item) => sum + item.applicantsCount, 0);
+        // جعل الطلبات الكبيرة (أعلى applicantsCount) تتصدر لضمان أن تكون من نصيب الأول عند التوزيع
+        const sortedForFairness = [...orderedByCountry].sort((a, b) => {
+          if (b.applicantsCount !== a.applicantsCount) {
+            return b.applicantsCount - a.applicantsCount;
+          }
+          if (a.priority !== b.priority) return a.priority - b.priority;
+          return a.originalIndex - b.originalIndex;
+        });
+
+        const totalApplicants = sortedForFairness.reduce(
+          (sum, item) => sum + item.applicantsCount,
+          0,
+        );
+
+        // حساب الحصة المستهدفة لكل شخص مع طرح الفائض من آخر شخص ثم الذي قبله
+        // مثال: 10 على 4 => [3, 3, 2, 2] | 7 على 4 => [2, 2, 2, 1]
         const baseShare = Math.floor(totalApplicants / empCount);
         const remainder = totalApplicants % empCount;
 
-        // الطرح من آخر شخص ثم الذي قبله: الموظفون الأولون يأخذون baseShare + (i < remainder ? 1 : 0)
-        // وعند وجود فائض أو طلب لا يسع بالكامل، نضبط الحدود بحيث لا يتجاوز الموظفون الأخيرون حصتهم
         const columns: EmployeeColumn[] = Array.from({ length: empCount }, (_, i) => ({
           index: i,
           name: `Employee ${i + 1}`,
@@ -655,19 +669,28 @@ export class RequestActions implements OnInit, OnDestroy {
           targetApplicants: baseShare + (i < remainder ? 1 : 0),
         }));
 
-        let currentEmpIdx = 0;
+        // إسناد كل طلب للشخص الأقل حملاً حالياً مع احترام الحصة المستهدفة وعدم ترك شخص فارغ
+        for (const item of sortedForFairness) {
+          // نبحث عن أول شخص لم يصل إلى targetApplicants ولا يتجاوزها بشكل مفرط، أو الأقل إجمالي أفراد حالياً
+          let chosenIdx = 0;
+          let bestScore = Number.POSITIVE_INFINITY;
 
-        for (const item of normalized) {
-          while (
-            currentEmpIdx < empCount - 1 &&
-            columns[currentEmpIdx].totalApplicants >= columns[currentEmpIdx].targetApplicants &&
-            columns[currentEmpIdx].totalApplicants + item.applicantsCount >
-              columns[currentEmpIdx].targetApplicants
-          ) {
-            currentEmpIdx++;
+          for (let i = 0; i < empCount; i++) {
+            const col = columns[i];
+            const remainingCapacity = col.targetApplicants - col.totalApplicants;
+            const wouldExceed = col.totalApplicants + item.applicantsCount > col.targetApplicants;
+
+            // نفضل من لديه سعة متبقية، ثم من هو أقل إجمالي أفراد، ثم الترتيب من الأول (i)
+            const penalty = wouldExceed ? 1000 + Math.abs(remainingCapacity) : 0;
+            const score = penalty + col.totalApplicants * 10 + i * 0.01;
+
+            if (score < bestScore) {
+              bestScore = score;
+              chosenIdx = i;
+            }
           }
 
-          const targetCol = columns[Math.min(currentEmpIdx, empCount - 1)];
+          const targetCol = columns[chosenIdx];
           targetCol.items.push({
             trackNumber: item.trackNumber,
             visaNameEn: item.visaNameEn,
@@ -677,11 +700,18 @@ export class RequestActions implements OnInit, OnDestroy {
           targetCol.totalApplicants += item.applicantsCount;
         }
 
+        // إعادة ترتيب عناصر كل عمود حسب أولوية الدولة للعرض والنسخ المنظم
+        for (const col of columns) {
+          col.items.sort(
+            (a, b) => this.getCountryPriority(a.visaNameEn) - this.getCountryPriority(b.visaNameEn),
+          );
+        }
+
         this.distributionColumns.set(columns);
         this.isDistributionModalOpen.set(true);
         this.isError.set(false);
         this.statusMessage.set(
-          `Distributed ${normalized.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
+          `Distributed ${sortedForFairness.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
         );
       },
       error: (err) => {
@@ -698,11 +728,21 @@ export class RequestActions implements OnInit, OnDestroy {
     return idx === -1 ? this.countryPriorityOrder.length : idx;
   }
 
-  private getApplicantBgColor(count: number): string {
-    if (count <= 1) return '#ffffff';
-    if (count === 2) return '#f4cccc';
-    if (count === 3) return '#ffff00';
-    if (count === 4) return '#00ff00';
+  private getOrderBgColor(visaNameEn: string, applicantsCount: number): string {
+    const country = visaNameEn.trim().toLowerCase();
+
+    if (country === 'united kingdom' || country === 'uk') {
+      return '#fca5a5'; // أحمر لطلبات بريطانيا دائماً
+    }
+
+    if (country === 'turkey' || country === 'türkiye') {
+      return '#d8b4fe'; // بنفسجي لطلبات تركيا دائماً
+    }
+
+    if (applicantsCount <= 1) return '#ffffff';
+    if (applicantsCount === 2) return '#f4cccc';
+    if (applicantsCount === 3) return '#ffff00';
+    if (applicantsCount === 4) return '#00ff00';
     return '#00ffff';
   }
 
@@ -720,11 +760,11 @@ export class RequestActions implements OnInit, OnDestroy {
 
     try {
       if (navigator.clipboard && typeof ClipboardItem !== 'undefined') {
-        const item = new ClipboardItem({
+        const clipboardItem = new ClipboardItem({
           'text/html': new Blob([htmlFragment], { type: 'text/html' }),
           'text/plain': new Blob([plainText], { type: 'text/plain' }),
         });
-        await navigator.clipboard.write([item]);
+        await navigator.clipboard.write([clipboardItem]);
       } else if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(plainText);
       }
@@ -736,7 +776,6 @@ export class RequestActions implements OnInit, OnDestroy {
         }
       }, 1500);
     } catch {
-      // Fallback في حال رفض المتصفح الكتابة بصيغة HTML
       const textarea = document.createElement('textarea');
       textarea.value = plainText;
       document.body.appendChild(textarea);
