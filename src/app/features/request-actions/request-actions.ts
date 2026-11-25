@@ -621,9 +621,7 @@ export class RequestActions implements OnInit, OnDestroy {
             }
           )?.data?.data ?? [];
 
-        // 1. تجهيز الطلبات وترتيبها:
-        // أولاً حسب أولوية الدولة (أمريكا -> كندا)
-        // ثانياً داخل كل دولة من أكبر عدد أفراد (5+) إلى أصغر عدد أفراد (1)
+        // 1. تجهيز الطلبات وترتيبها: أولاً حسب أولوية الدولة، وثانياً داخل كل دولة من الأكبر عدداً للأصغر
         const normalizedOrders = rawItems
           .map((item, idx) => {
             const trackNumber = String(item.track_number ?? '').trim();
@@ -651,7 +649,6 @@ export class RequestActions implements OnInit, OnDestroy {
           (sum, item) => sum + item.applicantsCount,
           0,
         );
-
         const baseApplicantShare = Math.floor(totalApplicants / empCount);
         const applicantRemainder = totalApplicants % empCount;
 
@@ -663,28 +660,58 @@ export class RequestActions implements OnInit, OnDestroy {
           targetApplicants: baseApplicantShare + (i < applicantRemainder ? 1 : 0),
         }));
 
-        // 2. توزيع متوازن لكل دولة وفي نفس الوقت متوازن في عدد الأفراد:
-        // نمر على الطلبات المرتبة (دولة بدولة، ومن الأكبر للأصغر في عدد الأفراد داخل كل دولة)
-        // وبمؤشر دوّار مستمر (cursor) يضمن أن كل دولة تتوزع بالتساوي على الموظفين (فارق 1 بحد أقصى)
-        // وأن النقص عند عدم قابلية القسمة يُطرح من آخر شخص ثم الذي قبله.
-        let roundRobinCursor = 0;
-
+        // تجميع الطلبات في مجموعات حسب الدولة بالترتيب المحدد
+        const countryGroups: Array<typeof normalizedOrders> = [];
         for (const order of normalizedOrders) {
-          const targetIdx = roundRobinCursor % empCount;
-          const targetCol = columns[targetIdx];
-
-          targetCol.items.push({
-            trackNumber: order.trackNumber,
-            visaNameEn: order.visaNameEn,
-            applicantsCount: order.applicantsCount,
-            bgColor: order.bgColor,
-          });
-          targetCol.totalApplicants += order.applicantsCount;
-
-          roundRobinCursor++;
+          const lastGroup = countryGroups[countryGroups.length - 1];
+          if (!lastGroup || lastGroup[0].priority !== order.priority) {
+            countryGroups.push([order]);
+          } else {
+            lastGroup.push(order);
+          }
         }
 
-        // 3. ضمان ترتيب كل عمود داخلياً: أولوية الدولة من الأعلى للأسفل، ثم عدد الأفراد من الأكبر للأصغر
+        const maxSizeTakenByPerson = Array.from({ length: empCount }, () => 0);
+
+        for (const group of countryGroups) {
+          // عند بدء دولة جديدة، نبدأ من الشخص الأقل في عدد الطلبات، ثم الأقل في عدد الأفراد، ثم الأول في الترتيب
+          let startIdx = this.findLeastLoadedEmployeeIndex(columns);
+
+          for (const order of group) {
+            let chosenIdx = -1;
+
+            // فحص الأشخاص بالترتيب من نقطة البداية للبحث عن شخص لم يأخذ نفس الحجم أو أكبر
+            for (let offset = 0; offset < empCount; offset++) {
+              const candidateIdx = (startIdx + offset) % empCount;
+              if (maxSizeTakenByPerson[candidateIdx] < order.applicantsCount) {
+                chosenIdx = candidateIdx;
+                break;
+              }
+            }
+
+            // إذا أخذ الجميع نفس الحجم أو أكبر، نرجع لأول شخص أقل في عدد الطلبات ثم الأفراد ثم الترتيب
+            if (chosenIdx === -1) {
+              chosenIdx = this.findLeastLoadedEmployeeIndex(columns);
+            }
+
+            const targetCol = columns[chosenIdx];
+            targetCol.items.push({
+              trackNumber: order.trackNumber,
+              visaNameEn: order.visaNameEn,
+              applicantsCount: order.applicantsCount,
+              bgColor: order.bgColor,
+            });
+            targetCol.totalApplicants += order.applicantsCount;
+
+            if (order.applicantsCount > maxSizeTakenByPerson[chosenIdx]) {
+              maxSizeTakenByPerson[chosenIdx] = order.applicantsCount;
+            }
+
+            startIdx = this.findLeastLoadedEmployeeIndex(columns);
+          }
+        }
+
+        // ترتيب عناصر كل عمود حسب أولوية الدولة ثم عدد الأفراد تنازلياً
         for (const col of columns) {
           col.items.sort((a, b) => {
             const pDiff =
@@ -709,6 +736,21 @@ export class RequestActions implements OnInit, OnDestroy {
     });
   }
 
+  private findLeastLoadedEmployeeIndex(columns: EmployeeColumn[]): number {
+    let bestIdx = 0;
+    for (let i = 1; i < columns.length; i++) {
+      if (columns[i].items.length < columns[bestIdx].items.length) {
+        bestIdx = i;
+      } else if (
+        columns[i].items.length === columns[bestIdx].items.length &&
+        columns[i].totalApplicants < columns[bestIdx].totalApplicants
+      ) {
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
   private getCountryPriority(visaNameEn: string): number {
     const normalized = visaNameEn.trim().toLowerCase();
     const idx = this.countryPriorityOrder.indexOf(normalized);
@@ -719,11 +761,11 @@ export class RequestActions implements OnInit, OnDestroy {
     const country = visaNameEn.trim().toLowerCase();
 
     if (country === 'united kingdom' || country === 'uk') {
-      return '#fca5a5'; // أحمر لطلبات بريطانيا دائماً
+      return '#fca5a5';
     }
 
     if (country === 'turkey' || country === 'türkiye') {
-      return '#d8b4fe'; // بنفسجي لطلبات تركيا دائماً
+      return '#d8b4fe';
     }
 
     if (applicantsCount <= 1) return '#ffffff';
