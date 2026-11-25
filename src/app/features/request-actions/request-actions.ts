@@ -32,7 +32,7 @@ export class RequestActions implements OnInit, OnDestroy {
   readonly isError = signal<boolean>(false);
   readonly apiResult = signal<unknown>(null);
 
-  readonly searchOrderId = signal<string>('');
+  readonly searchTrackNumber = signal<string>('');
   readonly isRunningSingleOrder = signal<boolean>(false);
   private readonly documentKeys: readonly string[] = [
     'bank_statement',
@@ -253,9 +253,9 @@ export class RequestActions implements OnInit, OnDestroy {
     return `${year}-${month}-${day}`;
   }
 
-  onOrderIdInput(event: Event): void {
+  onTrackNumberInput(event: Event): void {
     const val = (event.target as HTMLInputElement).value;
-    this.searchOrderId.set(val.trim());
+    this.searchTrackNumber.set(val.trim());
   }
 
   runAllSevenDocsForOrder(): void {
@@ -268,17 +268,17 @@ export class RequestActions implements OnInit, OnDestroy {
       return;
     }
 
-    const targetId = this.searchOrderId().trim();
-    if (!targetId) {
+    const targetTrackNumber = this.searchTrackNumber().trim();
+    if (!targetTrackNumber) {
       this.isError.set(true);
-      this.statusMessage.set('Please enter an Application ID first.');
+      this.statusMessage.set('Please enter a Track Number first.');
       return;
     }
 
     const rawResult = this.apiResult() as {
       data?: {
         data?: Array<{
-          id?: string;
+          track_number?: string;
           uuid?: string;
           doc_completion?: {
             whatsapp_reminder_check?: {
@@ -290,18 +290,22 @@ export class RequestActions implements OnInit, OnDestroy {
     } | null;
 
     const items = rawResult?.data?.data ?? [];
-    const matchedOrder = items.find((item) => String(item.id).trim() === targetId);
+    const matchedOrder = items.find(
+      (item) => String(item.track_number ?? '').trim() === targetTrackNumber,
+    );
 
     if (!matchedOrder || !matchedOrder.uuid) {
       this.isError.set(true);
-      this.statusMessage.set(`Order ID "${targetId}" was not found in the loaded list.`);
+      this.statusMessage.set(
+        `Track Number "${targetTrackNumber}" was not found in the loaded list.`,
+      );
       return;
     }
 
     if (matchedOrder.doc_completion?.whatsapp_reminder_check?.is_completed !== false) {
       this.isError.set(true);
       this.statusMessage.set(
-        `Order "${targetId}" skipped: whatsapp_reminder_check.is_completed is already true.`,
+        `Track Number "${targetTrackNumber}" skipped: whatsapp_reminder_check.is_completed is already true.`,
       );
       return;
     }
@@ -310,7 +314,7 @@ export class RequestActions implements OnInit, OnDestroy {
 
     this.isRunningSingleOrder.set(true);
     this.isError.set(false);
-    this.statusMessage.set(`Sending 7 document actions for Order #${targetId}...`);
+    this.statusMessage.set(`Sending 7 document actions for Track #${targetTrackNumber}...`);
 
     forkJoin(
       this.documentKeys.map((docKey) =>
@@ -325,15 +329,17 @@ export class RequestActions implements OnInit, OnDestroy {
         const succeeded = results.filter((r) => r.ok).length;
         const failed = results.length - succeeded;
 
-        console.log(`Order #${targetId} (${orderUuid}) 7-doc results:`, results);
+        console.log(`Track #${targetTrackNumber} (${orderUuid}) 7-doc results:`, results);
 
         if (failed === 0) {
           this.isError.set(false);
-          this.statusMessage.set(`All 7 document actions completed for Order #${targetId}.`);
+          this.statusMessage.set(
+            `All 7 document actions completed for Track #${targetTrackNumber}.`,
+          );
         } else {
           this.isError.set(true);
           this.statusMessage.set(
-            `Order #${targetId}: ${succeeded} of 7 succeeded (${failed} failed).`,
+            `Track #${targetTrackNumber}: ${succeeded} of 7 succeeded (${failed} failed).`,
           );
         }
       },
