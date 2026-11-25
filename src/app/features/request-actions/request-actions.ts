@@ -27,6 +27,21 @@ interface VersionResponse {
   builtAt?: string;
 }
 
+export interface DistributedOrderItem {
+  trackNumber: string;
+  visaNameEn: string;
+  applicantsCount: number;
+  bgColor: string;
+}
+
+export interface EmployeeColumn {
+  index: number;
+  name: string;
+  items: DistributedOrderItem[];
+  totalApplicants: number;
+  targetApplicants: number;
+}
+
 @Component({
   imports: [],
   selector: 'app-request-actions',
@@ -66,6 +81,38 @@ export class RequestActions implements OnInit, OnDestroy {
     'sponsor_parents_passports',
     'previous_visa_copies',
     'whatsapp_reminder_check',
+  ];
+
+  readonly employeeCount = signal<number>(4);
+  readonly isDistributing = signal<boolean>(false);
+  readonly isDistributionModalOpen = signal<boolean>(false);
+  readonly distributionColumns = signal<EmployeeColumn[]>([]);
+  readonly copiedColumnIndex = signal<number | null>(null);
+
+  private readonly countryPriorityOrder: readonly string[] = [
+    'united states',
+    'austria',
+    'germany',
+    'czechia',
+    'czech republic',
+    'sweden',
+    'greece',
+    'switzerland',
+    'norway',
+    'hungary',
+    'denmark',
+    'italy',
+    'france',
+    'portugal',
+    'spain',
+    'cyprus',
+    'the netherlands',
+    'netherlands',
+    'turkey',
+    'türkiye',
+    'united kingdom',
+    'ireland',
+    'canada',
   ];
 
   private readonly messageHandler = (event: MessageEvent) => {
@@ -523,5 +570,184 @@ export class RequestActions implements OnInit, OnDestroy {
           this.statusMessage.set(err?.message || 'Failed to execute document actions.');
         },
       });
+  }
+
+  onEmployeeCountChange(event: Event): void {
+    const val = Number((event.target as HTMLInputElement).value);
+    if (!Number.isFinite(val) || val < 1) {
+      this.employeeCount.set(1);
+      return;
+    }
+    this.employeeCount.set(Math.floor(val));
+  }
+
+  distributeRequestsFromApi(): void {
+    if (this.isDistributing()) return;
+
+    const cleanToken = this.stripBearer(this.token());
+    if (!cleanToken) {
+      this.isError.set(true);
+      this.statusMessage.set('No token available. Click "Get permission" first.');
+      return;
+    }
+
+    const from = this.fromDate() || this.getTodayIsoDate();
+    const to = this.toDate() || this.addBusinessDaysSkipFriSat(from, 3);
+    this.fromDate.set(from);
+    this.toDate.set(to);
+
+    const empCount = Math.max(1, Math.floor(this.employeeCount() || 1));
+
+    this.isDistributing.set(true);
+    this.isError.set(false);
+    this.statusMessage.set('Fetching requests and distributing...');
+
+    this.apiCall.getAllReq(cleanToken, from, to).subscribe({
+      next: (res) => {
+        this.isDistributing.set(false);
+        this.apiResult.set(res);
+
+        const rawItems =
+          (
+            res as {
+              data?: {
+                data?: Array<{
+                  track_number?: string;
+                  applicants_count?: number;
+                  visa?: { name_en?: string };
+                  country?: { name_en?: string };
+                }>;
+              };
+            }
+          )?.data?.data ?? [];
+
+        const normalized = rawItems
+          .map((item, idx) => {
+            const trackNumber = String(item.track_number ?? '').trim();
+            const visaNameEn = String(item.visa?.name_en ?? item.country?.name_en ?? '').trim();
+            const applicantsCount = Math.max(1, Number(item.applicants_count ?? 1) || 1);
+            return {
+              trackNumber,
+              visaNameEn,
+              applicantsCount,
+              bgColor: this.getApplicantBgColor(applicantsCount),
+              priority: this.getCountryPriority(visaNameEn),
+              originalIndex: idx,
+            };
+          })
+          .filter((x) => Boolean(x.trackNumber))
+          .sort((a, b) => {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return a.originalIndex - b.originalIndex;
+          });
+
+        const totalApplicants = normalized.reduce((sum, item) => sum + item.applicantsCount, 0);
+        const baseShare = Math.floor(totalApplicants / empCount);
+        const remainder = totalApplicants % empCount;
+
+        // الطرح من آخر شخص ثم الذي قبله: الموظفون الأولون يأخذون baseShare + (i < remainder ? 1 : 0)
+        // وعند وجود فائض أو طلب لا يسع بالكامل، نضبط الحدود بحيث لا يتجاوز الموظفون الأخيرون حصتهم
+        const columns: EmployeeColumn[] = Array.from({ length: empCount }, (_, i) => ({
+          index: i,
+          name: `Employee ${i + 1}`,
+          items: [],
+          totalApplicants: 0,
+          targetApplicants: baseShare + (i < remainder ? 1 : 0),
+        }));
+
+        let currentEmpIdx = 0;
+
+        for (const item of normalized) {
+          while (
+            currentEmpIdx < empCount - 1 &&
+            columns[currentEmpIdx].totalApplicants >= columns[currentEmpIdx].targetApplicants &&
+            columns[currentEmpIdx].totalApplicants + item.applicantsCount >
+              columns[currentEmpIdx].targetApplicants
+          ) {
+            currentEmpIdx++;
+          }
+
+          const targetCol = columns[Math.min(currentEmpIdx, empCount - 1)];
+          targetCol.items.push({
+            trackNumber: item.trackNumber,
+            visaNameEn: item.visaNameEn,
+            applicantsCount: item.applicantsCount,
+            bgColor: item.bgColor,
+          });
+          targetCol.totalApplicants += item.applicantsCount;
+        }
+
+        this.distributionColumns.set(columns);
+        this.isDistributionModalOpen.set(true);
+        this.isError.set(false);
+        this.statusMessage.set(
+          `Distributed ${normalized.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
+        );
+      },
+      error: (err) => {
+        this.isDistributing.set(false);
+        this.isError.set(true);
+        this.statusMessage.set(err?.message || 'Failed to fetch requests for distribution.');
+      },
+    });
+  }
+
+  private getCountryPriority(visaNameEn: string): number {
+    const normalized = visaNameEn.trim().toLowerCase();
+    const idx = this.countryPriorityOrder.indexOf(normalized);
+    return idx === -1 ? this.countryPriorityOrder.length : idx;
+  }
+
+  private getApplicantBgColor(count: number): string {
+    if (count <= 1) return '#ffffff';
+    if (count === 2) return '#f4cccc';
+    if (count === 3) return '#ffff00';
+    if (count === 4) return '#00ff00';
+    return '#00ffff';
+  }
+
+  async copyColumnToClipboard(col: EmployeeColumn): Promise<void> {
+    if (!this.isBrowser) return;
+
+    const plainText = col.items.map((item) => item.trackNumber).join('\n');
+    const htmlRows = col.items
+      .map(
+        (item) =>
+          `<tr><td style="background-color:${item.bgColor};mso-background-color:${item.bgColor};">${item.trackNumber}</td></tr>`,
+      )
+      .join('');
+    const htmlFragment = `<table><tbody>${htmlRows}</tbody></table>`;
+
+    try {
+      if (navigator.clipboard && typeof ClipboardItem !== 'undefined') {
+        const item = new ClipboardItem({
+          'text/html': new Blob([htmlFragment], { type: 'text/html' }),
+          'text/plain': new Blob([plainText], { type: 'text/plain' }),
+        });
+        await navigator.clipboard.write([item]);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(plainText);
+      }
+
+      this.copiedColumnIndex.set(col.index);
+      setTimeout(() => {
+        if (this.copiedColumnIndex() === col.index) {
+          this.copiedColumnIndex.set(null);
+        }
+      }, 1500);
+    } catch {
+      // Fallback في حال رفض المتصفح الكتابة بصيغة HTML
+      const textarea = document.createElement('textarea');
+      textarea.value = plainText;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      this.copiedColumnIndex.set(col.index);
+    }
+  }
+
+  closeDistributionModal(): void {
+    this.isDistributionModalOpen.set(false);
   }
 }
