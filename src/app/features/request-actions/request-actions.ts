@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit, PLATFORM_ID, inject, signal } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
 import { ApiCalling } from '../../api-calling';
-import { catchError, forkJoin, map, of } from 'rxjs';
+import { catchError, concatMap, forkJoin, from, map, of, switchMap, toArray } from 'rxjs';
 
 interface ExtensionFlowResponse {
   ok?: boolean;
@@ -374,58 +374,88 @@ export class RequestActions implements OnInit, OnDestroy {
     }
 
     const docCompletion = matchedOrder.doc_completion ?? {};
-    const pendingDocKeys = this.documentKeys.filter(
+    const allOrderDocKeys = Array.from(
+      new Set([...this.documentKeys, ...Object.keys(docCompletion)]),
+    );
+
+    const pendingDocKeys = allOrderDocKeys.filter(
       (docKey) => docCompletion[docKey]?.is_completed !== true,
     );
 
-    if (pendingDocKeys.length === 0) {
-      this.isError.set(false);
-      this.statusMessage.set(
-        `All 7 documents for Track #${targetTrackNumber} are already completed.`,
-      );
-      return;
-    }
-
     const orderUuid = matchedOrder.uuid;
+    const keysToExecute = pendingDocKeys.length > 0 ? pendingDocKeys : [allOrderDocKeys[0]];
 
     this.isRunningSingleOrder.set(true);
     this.isError.set(false);
     this.statusMessage.set(
-      `Sending ${pendingDocKeys.length} pending document action(s) for Track #${targetTrackNumber}...`,
+      pendingDocKeys.length > 0
+        ? `Sending ${keysToExecute.length} pending document action(s) sequentially for Track #${targetTrackNumber}...`
+        : `All documents already marked true; sending final check confirmation for Track #${targetTrackNumber}...`,
     );
 
-    forkJoin(
-      pendingDocKeys.map((docKey) =>
-        this.apiCall.doneAllActionForRequest(cleanToken, docKey, orderUuid).pipe(
-          map((res) => ({ docKey, ok: true as const, res })),
-          catchError((err) => of({ docKey, ok: false as const, error: err })),
-        ),
-      ),
-    ).subscribe({
-      next: (results) => {
-        this.isRunningSingleOrder.set(false);
-        const succeeded = results.filter((r) => r.ok).length;
-        const failed = results.length - succeeded;
-
-        console.log(`Track #${targetTrackNumber} (${orderUuid}) pending docs results:`, results);
-
-        if (failed === 0) {
-          this.isError.set(false);
+    from(keysToExecute)
+      .pipe(
+        concatMap((docKey, index) => {
           this.statusMessage.set(
-            `Completed ${succeeded} pending document action(s) for Track #${targetTrackNumber}.`,
+            `Track #${targetTrackNumber}: processing ${index + 1}/${keysToExecute.length} (${docKey})...`,
           );
-        } else {
+          return this.apiCall.doneAllActionForRequest(cleanToken, docKey, orderUuid).pipe(
+            map((res) => ({ docKey, ok: true as const, res })),
+            catchError((err) => of({ docKey, ok: false as const, error: err })),
+          );
+        }),
+        toArray(),
+        switchMap((results) => {
+          const allSucceeded = results.every((r) => r.ok);
+          const isFullyChecked = results.some(
+            (r) =>
+              r.ok &&
+              (r.res as { data?: { request_fully_checked?: boolean } })?.data
+                ?.request_fully_checked === true,
+          );
+
+          if (allSucceeded && !isFullyChecked && keysToExecute.length > 0) {
+            const confirmDocKey = keysToExecute[0];
+            return this.apiCall.doneAllActionForRequest(cleanToken, confirmDocKey, orderUuid).pipe(
+              map((res) => [...results, { docKey: confirmDocKey, ok: true as const, res }]),
+              catchError((err) =>
+                of([...results, { docKey: confirmDocKey, ok: false as const, error: err }]),
+              ),
+            );
+          }
+
+          return of(results);
+        }),
+      )
+      .subscribe({
+        next: (results) => {
+          this.isRunningSingleOrder.set(false);
+          const succeeded = results.filter((r) => r.ok).length;
+          const failed = results.length - succeeded;
+
+          console.log(
+            `Track #${targetTrackNumber} (${orderUuid}) sequential docs results:`,
+            results,
+          );
+
+          if (failed === 0) {
+            this.isError.set(false);
+            this.statusMessage.set(
+              `Completed ${succeeded} document action(s) for Track #${targetTrackNumber}. Refreshing list...`,
+            );
+            this.sendGetRequest();
+          } else {
+            this.isError.set(true);
+            this.statusMessage.set(
+              `Track #${targetTrackNumber}: ${succeeded} of ${results.length} succeeded (${failed} failed).`,
+            );
+          }
+        },
+        error: (err) => {
+          this.isRunningSingleOrder.set(false);
           this.isError.set(true);
-          this.statusMessage.set(
-            `Track #${targetTrackNumber}: ${succeeded} of ${results.length} succeeded (${failed} failed).`,
-          );
-        }
-      },
-      error: (err) => {
-        this.isRunningSingleOrder.set(false);
-        this.isError.set(true);
-        this.statusMessage.set(err?.message || 'Failed to execute document actions.');
-      },
-    });
+          this.statusMessage.set(err?.message || 'Failed to execute document actions.');
+        },
+      });
   }
 }
