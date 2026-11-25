@@ -278,7 +278,6 @@ export class RequestActions implements OnInit, OnDestroy {
 
     this.apiCall.getAllReq(cleanToken, from, to).subscribe({
       next: (res) => {
-        console.log(res);
         this.apiResult.set(res);
         this.isError.set(false);
         this.statusMessage.set('Request completed successfully.');
@@ -504,11 +503,6 @@ export class RequestActions implements OnInit, OnDestroy {
           this.isRunningSingleOrder.set(false);
           const succeeded = results.filter((r) => r.ok).length;
           const failed = results.length - succeeded;
-
-          console.log(
-            `Track #${targetTrackNumber} (${orderUuid}) sequential docs results:`,
-            results,
-          );
 
           if (failed === 0) {
             this.isError.set(false);
