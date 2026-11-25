@@ -280,11 +280,7 @@ export class RequestActions implements OnInit, OnDestroy {
         data?: Array<{
           track_number?: string;
           uuid?: string;
-          doc_completion?: {
-            whatsapp_reminder_check?: {
-              is_completed?: boolean;
-            };
-          };
+          doc_completion?: Record<string, { is_completed?: boolean } | undefined>;
         }>;
       };
     } | null;
@@ -302,10 +298,15 @@ export class RequestActions implements OnInit, OnDestroy {
       return;
     }
 
-    if (matchedOrder.doc_completion?.whatsapp_reminder_check?.is_completed !== false) {
-      this.isError.set(true);
+    const docCompletion = matchedOrder.doc_completion ?? {};
+    const pendingDocKeys = this.documentKeys.filter(
+      (docKey) => docCompletion[docKey]?.is_completed !== true,
+    );
+
+    if (pendingDocKeys.length === 0) {
+      this.isError.set(false);
       this.statusMessage.set(
-        `Track Number "${targetTrackNumber}" skipped: whatsapp_reminder_check.is_completed is already true.`,
+        `All 7 documents for Track #${targetTrackNumber} are already completed.`,
       );
       return;
     }
@@ -314,10 +315,12 @@ export class RequestActions implements OnInit, OnDestroy {
 
     this.isRunningSingleOrder.set(true);
     this.isError.set(false);
-    this.statusMessage.set(`Sending 7 document actions for Track #${targetTrackNumber}...`);
+    this.statusMessage.set(
+      `Sending ${pendingDocKeys.length} pending document action(s) for Track #${targetTrackNumber}...`,
+    );
 
     forkJoin(
-      this.documentKeys.map((docKey) =>
+      pendingDocKeys.map((docKey) =>
         this.apiCall.doneAllActionForRequest(cleanToken, docKey, orderUuid).pipe(
           map((res) => ({ docKey, ok: true as const, res })),
           catchError((err) => of({ docKey, ok: false as const, error: err })),
@@ -329,24 +332,24 @@ export class RequestActions implements OnInit, OnDestroy {
         const succeeded = results.filter((r) => r.ok).length;
         const failed = results.length - succeeded;
 
-        console.log(`Track #${targetTrackNumber} (${orderUuid}) 7-doc results:`, results);
+        console.log(`Track #${targetTrackNumber} (${orderUuid}) pending docs results:`, results);
 
         if (failed === 0) {
           this.isError.set(false);
           this.statusMessage.set(
-            `All 7 document actions completed for Track #${targetTrackNumber}.`,
+            `Completed ${succeeded} pending document action(s) for Track #${targetTrackNumber}.`,
           );
         } else {
           this.isError.set(true);
           this.statusMessage.set(
-            `Track #${targetTrackNumber}: ${succeeded} of 7 succeeded (${failed} failed).`,
+            `Track #${targetTrackNumber}: ${succeeded} of ${results.length} succeeded (${failed} failed).`,
           );
         }
       },
       error: (err) => {
         this.isRunningSingleOrder.set(false);
         this.isError.set(true);
-        this.statusMessage.set(err?.message || 'Failed to execute 7 document actions.');
+        this.statusMessage.set(err?.message || 'Failed to execute document actions.');
       },
     });
   }
