@@ -1,0 +1,8 @@
+{
+  "/api/**": {
+    "target": "https://visa-be.directksa.com",
+    "secure": true,
+    "changeOrigin": true,
+    "logLevel": "debug"
+  }
+}
