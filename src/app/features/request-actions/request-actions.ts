@@ -21,6 +21,7 @@ export class RequestActions implements OnInit, OnDestroy {
   private readonly isBrowser = isPlatformBrowser(this.platformId);
 
   private readonly extensionId = 'jmmhkombpbjgkokbdkbgkcjifohagene';
+  private isAutoSyncing = false;
 
   readonly token = signal<string>('');
   readonly fromDate = signal<string>(this.getTodayIsoDate());
@@ -52,12 +53,21 @@ export class RequestActions implements OnInit, OnDestroy {
     }
   };
 
+  private readonly visibilityHandler = () => {
+    if (!this.isBrowser) return;
+
+    if (document.visibilityState === 'visible') {
+      this.autoRefreshTokenAndRequests();
+    }
+  };
+
   ngOnInit(): void {
     this.fromDate.set(this.getTodayIsoDate());
     this.toDate.set(this.getTodayIsoDate());
 
     if (this.isBrowser) {
       window.addEventListener('message', this.messageHandler);
+      document.addEventListener('visibilitychange', this.visibilityHandler);
       this.fetchTokenFromExtension();
     }
   }
@@ -65,6 +75,7 @@ export class RequestActions implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     if (this.isBrowser) {
       window.removeEventListener('message', this.messageHandler);
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
     }
   }
 
@@ -78,8 +89,31 @@ export class RequestActions implements OnInit, OnDestroy {
     if (val) this.toDate.set(val);
   }
 
-  fetchTokenFromExtension(): void {
-    if (!this.isBrowser || this.isFetchingToken()) return;
+  private autoRefreshTokenAndRequests(): void {
+    if (
+      this.isAutoSyncing ||
+      this.isFetchingToken() ||
+      this.isRunningBatch() ||
+      this.isRunningSingleOrder()
+    ) {
+      return;
+    }
+
+    this.isAutoSyncing = true;
+
+    this.fetchTokenFromExtension((ok) => {
+      if (ok) {
+        this.sendGetRequest();
+      }
+      this.isAutoSyncing = false;
+    });
+  }
+
+  fetchTokenFromExtension(onDone?: (success: boolean) => void): void {
+    if (!this.isBrowser || this.isFetchingToken()) {
+      onDone?.(false);
+      return;
+    }
 
     const chromeApi = (
       window as unknown as {
@@ -99,6 +133,7 @@ export class RequestActions implements OnInit, OnDestroy {
     if (!chromeApi?.runtime?.sendMessage) {
       this.isError.set(true);
       this.statusMessage.set('Browser extension bridge is not available.');
+      onDone?.(false);
       return;
     }
 
@@ -121,18 +156,21 @@ export class RequestActions implements OnInit, OnDestroy {
           this.statusMessage.set(
             'Extension connection error: ' + (chromeApi.runtime.lastError.message || ''),
           );
+          onDone?.(false);
           return;
         }
 
         if (!res?.ok || !res.token) {
           this.isError.set(true);
           this.statusMessage.set(res?.error || 'Could not retrieve token.');
+          onDone?.(false);
           return;
         }
 
         this.setToken(res.token);
         this.isError.set(false);
         this.statusMessage.set('Token captured and stored.');
+        onDone?.(true);
       },
     );
   }
