@@ -25,7 +25,7 @@ export class RequestActions implements OnInit, OnDestroy {
 
   readonly token = signal<string>('');
   readonly fromDate = signal<string>(this.getTodayIsoDate());
-  readonly toDate = signal<string>(this.getTodayIsoDate());
+  readonly toDate = signal<string>(this.addBusinessDaysSkipFriSat(this.getTodayIsoDate(), 3));
 
   readonly isFetchingToken = signal<boolean>(false);
   readonly isRunningBatch = signal<boolean>(false);
@@ -62,13 +62,16 @@ export class RequestActions implements OnInit, OnDestroy {
   };
 
   ngOnInit(): void {
-    this.fromDate.set(this.getTodayIsoDate());
-    this.toDate.set(this.getTodayIsoDate());
+    this.resetDatesToDefault();
 
     if (this.isBrowser) {
       window.addEventListener('message', this.messageHandler);
       document.addEventListener('visibilitychange', this.visibilityHandler);
-      this.fetchTokenFromExtension();
+      this.fetchTokenFromExtension((ok) => {
+        if (ok) {
+          this.sendGetRequest();
+        }
+      });
     }
   }
 
@@ -81,12 +84,20 @@ export class RequestActions implements OnInit, OnDestroy {
 
   onFromDateChange(event: Event): void {
     const val = (event.target as HTMLInputElement).value;
-    if (val) this.fromDate.set(val);
+    if (!val) return;
+    this.fromDate.set(val);
+    this.toDate.set(this.addBusinessDaysSkipFriSat(val, 3));
   }
 
   onToDateChange(event: Event): void {
     const val = (event.target as HTMLInputElement).value;
     if (val) this.toDate.set(val);
+  }
+
+  resetDatesToDefault(): void {
+    const today = this.getTodayIsoDate();
+    this.fromDate.set(today);
+    this.toDate.set(this.addBusinessDaysSkipFriSat(today, 3));
   }
 
   private autoRefreshTokenAndRequests(): void {
@@ -184,10 +195,16 @@ export class RequestActions implements OnInit, OnDestroy {
       return;
     }
 
+    const from = this.fromDate() || this.getTodayIsoDate();
+    const to = this.toDate() || this.addBusinessDaysSkipFriSat(from, 3);
+
+    this.fromDate.set(from);
+    this.toDate.set(to);
+
     this.isError.set(false);
     this.statusMessage.set('Sending request...');
 
-    this.apiCall.getAllReq(cleanToken, this.fromDate(), this.toDate()).subscribe({
+    this.apiCall.getAllReq(cleanToken, from, to).subscribe({
       next: (res) => {
         console.log(res);
         this.apiResult.set(res);
@@ -284,10 +301,30 @@ export class RequestActions implements OnInit, OnDestroy {
   }
 
   private getTodayIsoDate(): string {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
+    return this.formatIsoDate(new Date());
+  }
+
+  private addBusinessDaysSkipFriSat(startIsoDate: string, daysToAdd: number): string {
+    const [year, month, day] = startIsoDate.split('-').map(Number);
+    const cursor = new Date(year, month - 1, day);
+
+    let countedDays = 0;
+
+    while (countedDays < daysToAdd) {
+      cursor.setDate(cursor.getDate() + 1);
+      const dayOfWeek = cursor.getDay(); // 5 = Friday, 6 = Saturday
+      if (dayOfWeek !== 5 && dayOfWeek !== 6) {
+        countedDays++;
+      }
+    }
+
+    return this.formatIsoDate(cursor);
+  }
+
+  private formatIsoDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
   }
 
