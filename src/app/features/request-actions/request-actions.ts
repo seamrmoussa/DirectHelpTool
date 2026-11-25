@@ -621,8 +621,10 @@ export class RequestActions implements OnInit, OnDestroy {
             }
           )?.data?.data ?? [];
 
-        // ترتيب الطلبات حسب أولوية الدول ثم الحفاظ على الترتيب الأصلي
-        const orderedByCountry = rawItems
+        // 1. تجهيز الطلبات وترتيبها:
+        // أولاً حسب أولوية الدولة (أمريكا -> كندا)
+        // ثانياً داخل كل دولة من أكبر عدد أفراد (5+) إلى أصغر عدد أفراد (1)
+        const normalizedOrders = rawItems
           .map((item, idx) => {
             const trackNumber = String(item.track_number ?? '').trim();
             const visaNameEn = String(item.visa?.name_en ?? item.country?.name_en ?? '').trim();
@@ -639,79 +641,64 @@ export class RequestActions implements OnInit, OnDestroy {
           .filter((x) => Boolean(x.trackNumber))
           .sort((a, b) => {
             if (a.priority !== b.priority) return a.priority - b.priority;
+            if (b.applicantsCount !== a.applicantsCount) {
+              return b.applicantsCount - a.applicantsCount;
+            }
             return a.originalIndex - b.originalIndex;
           });
 
-        // جعل الطلبات الكبيرة (أعلى applicantsCount) تتصدر لضمان أن تكون من نصيب الأول عند التوزيع
-        const sortedForFairness = [...orderedByCountry].sort((a, b) => {
-          if (b.applicantsCount !== a.applicantsCount) {
-            return b.applicantsCount - a.applicantsCount;
-          }
-          if (a.priority !== b.priority) return a.priority - b.priority;
-          return a.originalIndex - b.originalIndex;
-        });
-
-        const totalApplicants = sortedForFairness.reduce(
+        const totalApplicants = normalizedOrders.reduce(
           (sum, item) => sum + item.applicantsCount,
           0,
         );
 
-        // حساب الحصة المستهدفة لكل شخص مع طرح الفائض من آخر شخص ثم الذي قبله
-        // مثال: 10 على 4 => [3, 3, 2, 2] | 7 على 4 => [2, 2, 2, 1]
-        const baseShare = Math.floor(totalApplicants / empCount);
-        const remainder = totalApplicants % empCount;
+        const baseApplicantShare = Math.floor(totalApplicants / empCount);
+        const applicantRemainder = totalApplicants % empCount;
 
         const columns: EmployeeColumn[] = Array.from({ length: empCount }, (_, i) => ({
           index: i,
           name: `Employee ${i + 1}`,
           items: [],
           totalApplicants: 0,
-          targetApplicants: baseShare + (i < remainder ? 1 : 0),
+          targetApplicants: baseApplicantShare + (i < applicantRemainder ? 1 : 0),
         }));
 
-        // إسناد كل طلب للشخص الأقل حملاً حالياً مع احترام الحصة المستهدفة وعدم ترك شخص فارغ
-        for (const item of sortedForFairness) {
-          // نبحث عن أول شخص لم يصل إلى targetApplicants ولا يتجاوزها بشكل مفرط، أو الأقل إجمالي أفراد حالياً
-          let chosenIdx = 0;
-          let bestScore = Number.POSITIVE_INFINITY;
+        // 2. توزيع متوازن لكل دولة وفي نفس الوقت متوازن في عدد الأفراد:
+        // نمر على الطلبات المرتبة (دولة بدولة، ومن الأكبر للأصغر في عدد الأفراد داخل كل دولة)
+        // وبمؤشر دوّار مستمر (cursor) يضمن أن كل دولة تتوزع بالتساوي على الموظفين (فارق 1 بحد أقصى)
+        // وأن النقص عند عدم قابلية القسمة يُطرح من آخر شخص ثم الذي قبله.
+        let roundRobinCursor = 0;
 
-          for (let i = 0; i < empCount; i++) {
-            const col = columns[i];
-            const remainingCapacity = col.targetApplicants - col.totalApplicants;
-            const wouldExceed = col.totalApplicants + item.applicantsCount > col.targetApplicants;
+        for (const order of normalizedOrders) {
+          const targetIdx = roundRobinCursor % empCount;
+          const targetCol = columns[targetIdx];
 
-            // نفضل من لديه سعة متبقية، ثم من هو أقل إجمالي أفراد، ثم الترتيب من الأول (i)
-            const penalty = wouldExceed ? 1000 + Math.abs(remainingCapacity) : 0;
-            const score = penalty + col.totalApplicants * 10 + i * 0.01;
-
-            if (score < bestScore) {
-              bestScore = score;
-              chosenIdx = i;
-            }
-          }
-
-          const targetCol = columns[chosenIdx];
           targetCol.items.push({
-            trackNumber: item.trackNumber,
-            visaNameEn: item.visaNameEn,
-            applicantsCount: item.applicantsCount,
-            bgColor: item.bgColor,
+            trackNumber: order.trackNumber,
+            visaNameEn: order.visaNameEn,
+            applicantsCount: order.applicantsCount,
+            bgColor: order.bgColor,
           });
-          targetCol.totalApplicants += item.applicantsCount;
+          targetCol.totalApplicants += order.applicantsCount;
+
+          roundRobinCursor++;
         }
 
-        // إعادة ترتيب عناصر كل عمود حسب أولوية الدولة للعرض والنسخ المنظم
+        // 3. ضمان ترتيب كل عمود داخلياً: أولوية الدولة من الأعلى للأسفل، ثم عدد الأفراد من الأكبر للأصغر
         for (const col of columns) {
-          col.items.sort(
-            (a, b) => this.getCountryPriority(a.visaNameEn) - this.getCountryPriority(b.visaNameEn),
-          );
+          col.items.sort((a, b) => {
+            const pDiff =
+              this.getCountryPriority(a.visaNameEn) - this.getCountryPriority(b.visaNameEn);
+            if (pDiff !== 0) return pDiff;
+            return b.applicantsCount - a.applicantsCount;
+          });
         }
 
         this.distributionColumns.set(columns);
         this.isDistributionModalOpen.set(true);
         this.isError.set(false);
         this.statusMessage.set(
-          `Distributed ${sortedForFairness.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
+          `Distributed ${normalizedOrders.length} order(s) (${totalApplicants} applicants) across ${empCount} employee(s).`,
         );
       },
       error: (err) => {
