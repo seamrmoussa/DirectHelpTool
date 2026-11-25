@@ -1,12 +1,30 @@
 import { Component, OnDestroy, OnInit, PLATFORM_ID, inject, signal } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
+import { HttpClient } from '@angular/common/http';
 import { ApiCalling } from '../../api-calling';
-import { catchError, concatMap, forkJoin, from, map, of, switchMap, toArray } from 'rxjs';
+import {
+  Subscription,
+  catchError,
+  concatMap,
+  filter,
+  forkJoin,
+  from,
+  interval,
+  map,
+  of,
+  switchMap,
+  toArray,
+} from 'rxjs';
 
 interface ExtensionFlowResponse {
   ok?: boolean;
   token?: string;
   error?: string;
+}
+
+interface VersionResponse {
+  version: string;
+  builtAt?: string;
 }
 
 @Component({
@@ -17,11 +35,16 @@ interface ExtensionFlowResponse {
 })
 export class RequestActions implements OnInit, OnDestroy {
   private readonly apiCall = inject(ApiCalling);
+  private readonly http = inject(HttpClient);
   private readonly platformId = inject(PLATFORM_ID);
   private readonly isBrowser = isPlatformBrowser(this.platformId);
 
   private readonly extensionId = 'jmmhkombpbjgkokbdkbgkcjifohagene';
   private isAutoSyncing = false;
+
+  private currentBuildVersion: string | null = null;
+  private isReloadingForNewBuild = false;
+  private versionPollSub?: Subscription;
 
   readonly token = signal<string>('');
   readonly fromDate = signal<string>(this.getTodayIsoDate());
@@ -57,6 +80,7 @@ export class RequestActions implements OnInit, OnDestroy {
     if (!this.isBrowser) return;
 
     if (document.visibilityState === 'visible') {
+      this.checkForNewBuild();
       this.autoRefreshTokenAndRequests();
     }
   };
@@ -67,6 +91,7 @@ export class RequestActions implements OnInit, OnDestroy {
     if (this.isBrowser) {
       window.addEventListener('message', this.messageHandler);
       document.addEventListener('visibilitychange', this.visibilityHandler);
+      this.startBuildVersionWatcher();
       this.fetchTokenFromExtension((ok) => {
         if (ok) {
           this.sendGetRequest();
@@ -76,10 +101,57 @@ export class RequestActions implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.versionPollSub?.unsubscribe();
     if (this.isBrowser) {
       window.removeEventListener('message', this.messageHandler);
       document.removeEventListener('visibilitychange', this.visibilityHandler);
     }
+  }
+
+  private startBuildVersionWatcher(): void {
+    this.http
+      .get<VersionResponse>(`/version.json?t=${Date.now()}`, {
+        headers: { 'Cache-Control': 'no-cache' },
+      })
+      .subscribe({
+        next: (res) => {
+          if (res?.version) {
+            this.currentBuildVersion = res.version;
+          }
+        },
+        error: () => {},
+      });
+
+    this.versionPollSub = interval(60_000).subscribe(() => {
+      this.checkForNewBuild();
+    });
+  }
+
+  private checkForNewBuild(): void {
+    if (
+      !this.isBrowser ||
+      this.isReloadingForNewBuild ||
+      !this.currentBuildVersion ||
+      this.isRunningBatch() ||
+      this.isRunningSingleOrder()
+    ) {
+      return;
+    }
+
+    this.http
+      .get<VersionResponse>(`/version.json?t=${Date.now()}`, {
+        headers: { 'Cache-Control': 'no-cache' },
+      })
+      .pipe(filter((res) => Boolean(res?.version)))
+      .subscribe({
+        next: (res) => {
+          if (res.version !== this.currentBuildVersion) {
+            this.isReloadingForNewBuild = true;
+            window.location.reload();
+          }
+        },
+        error: () => {},
+      });
   }
 
   onFromDateChange(event: Event): void {
